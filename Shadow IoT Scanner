@@ -1,0 +1,686 @@
+require 'socket'
+require 'pcap'
+require 'ipaddr'
+require 'json'
+require 'openssl'
+require 'mqtt'
+require 'rest-client'
+require 'yaml'
+
+class ShadowIoTScanner
+  def initialize(config_file = 'config.yml')
+    @config = YAML.load_file(config_file)
+    @device_db = load_device_database
+    @discovered_devices = {}
+    @known_vulnerabilities = load_vulnerability_database
+    @siem_integration = SIEMIntegration.new(@config['siem'])
+    @policy_engine = SecurityPolicyEngine.new(@config['policies'])
+    @anomaly_detector = AnomalyDetector.new
+    @network_segmenter = NetworkSegmenter.new
+    @logger = Logger.new(@config['log_file'] || STDOUT)
+  end
+
+  def start_scanning
+    @logger.info("Starting Shadow IoT Scanner...")
+    
+    # Start passive network scanning
+    start_passive_scanning
+    
+    # Start active scanning for deeper inspection (optional based on config)
+    start_active_scanning if @config['enable_active_scanning']
+    
+    # Start protocol-specific scanners
+    start_protocol_scanners
+    
+    # Start anomaly detection
+    @anomaly_detector.start_monitoring(@discovered_devices)
+    
+    # Start periodic vulnerability assessment
+    start_vulnerability_assessment
+    
+    @logger.info("Shadow IoT Scanner is running")
+  end
+  
+  def start_passive_scanning
+    Thread.new do
+      @logger.info("Starting passive network scanning")
+      
+      # Setup packet capture on specified interfaces
+      @config['network_interfaces'].each do |interface|
+        begin
+          cap = Pcap::Capture.open_live(interface, 1500, true, 1000)
+          
+          # Set filter to focus on IoT-related traffic
+          cap.setfilter('udp port 5353 or tcp port 80 or tcp port 443 or tcp port 1883 or tcp port 8883')
+          
+          # Start packet processing
+          cap.loop do |packet|
+            process_packet(packet)
+          end
+        rescue => e
+          @logger.error("Error in passive scanning on interface #{interface}: #{e.message}")
+        end
+      end
+    end
+  end
+  
+  def process_packet(packet)
+    # Extract device information from packet
+    device_info = extract_device_info(packet)
+    return unless device_info
+    
+    device_id = device_info[:mac_address]
+    
+    # If this is a new device, process it
+    unless @discovered_devices[device_id]
+      @discovered_devices[device_id] = device_info
+      fingerprint_device(device_info)
+      assess_device_risk(device_info)
+      enforce_security_policy(device_info)
+      @siem_integration.report_new_device(device_info)
+      
+      @logger.info("New device discovered: #{device_info[:manufacturer]} #{device_info[:model]} (#{device_info[:ip_address]})")
+    end
+  end
+  
+  def extract_device_info(packet)
+    # Parse packet to extract device information
+    # This is a simplified placeholder - real implementation would be more complex
+    {
+      ip_address: '192.168.1.100',
+      mac_address: '00:11:22:33:44:55',
+      first_seen: Time.now,
+      last_seen: Time.now,
+      protocols: ['HTTP'],
+      ports: [80, 443],
+      traffic_stats: {
+        bytes_in: 1024,
+        bytes_out: 512,
+        packets_in: 10,
+        packets_out: 5
+      }
+    }
+  end
+  
+  def fingerprint_device(device_info)
+    # Analyze traffic patterns, headers, and responses to identify device type
+    device_signature = generate_device_signature(device_info)
+    
+    # Look up signature in device database
+    if match = find_device_match(device_signature)
+      device_info[:manufacturer] = match[:manufacturer]
+      device_info[:model] = match[:model]
+      device_info[:device_type] = match[:device_type]
+      device_info[:firmware_version] = match[:firmware_version]
+      device_info[:identified_by] = 'signature_match'
+    else
+      # If no match, try to identify using other methods
+      identify_device_by_other_methods(device_info)
+    end
+  end
+  
+  def generate_device_signature(device_info)
+    # Create a unique signature based on device behavior and responses
+    # This would analyze HTTP headers, DHCP requests, mDNS announcements, etc.
+    "#{device_info[:protocols].join('-')}-#{device_info[:ports].join('-')}"
+  end
+  
+  def find_device_match(signature)
+    @device_db.find { |device| device[:signature] == signature }
+  end
+  
+  def identify_device_by_other_methods(device_info)
+    # Try MAC OUI lookup
+    if manufacturer = lookup_mac_manufacturer(device_info[:mac_address])
+      device_info[:manufacturer] = manufacturer
+      device_info[:identified_by] = 'mac_lookup'
+    end
+    
+    # Try banner grabbing
+    if banner_info = grab_service_banners(device_info[:ip_address], device_info[:ports])
+      parse_banner_information(device_info, banner_info)
+      device_info[:identified_by] = 'banner_grab'
+    end
+    
+    # If still unidentified, mark as unknown
+    unless device_info[:manufacturer]
+      device_info[:manufacturer] = 'Unknown'
+      device_info[:model] = 'Unknown'
+      device_info[:device_type] = 'Unknown'
+      device_info[:identified_by] = 'unidentified'
+    end
+  end
+  
+  def assess_device_risk(device_info)
+    risk_score = 0.0
+    risk_factors = []
+    
+    # Check if device is in authorized inventory
+    unless device_authorized?(device_info)
+      risk_score += 0.4
+      risk_factors << 'Unauthorized device'
+    end
+    
+    # Check for known vulnerabilities
+    if vulns = check_vulnerabilities(device_info)
+      max_cvss = vulns.map { |v| v[:cvss] }.max || 0
+      risk_score += (max_cvss / 10.0) * 0.3
+      risk_factors << "Known vulnerabilities (max CVSS: #{max_cvss})"
+    end
+    
+    # Check for default credentials
+    if has_default_credentials?(device_info)
+      risk_score += 0.3
+      risk_factors << 'Default credentials'
+    end
+    
+    # Check for unencrypted communications
+    unless uses_encryption?(device_info)
+      risk_score += 0.2
+      risk_factors << 'Unencrypted communications'
+    end
+    
+    # Check for excessive permissions/access
+    if has_excessive_access?(device_info)
+      risk_score += 0.2
+      risk_factors << 'Excessive network access'
+    end
+    
+    # Normalize risk score to 0-1 range
+    risk_score = [risk_score, 1.0].min
+    
+    # Update device info with risk assessment
+    device_info[:risk_score] = risk_score
+    device_info[:risk_factors] = risk_factors
+    device_info[:risk_level] = categorize_risk_level(risk_score)
+    
+    @logger.info("Risk assessment for #{device_info[:ip_address]}: #{device_info[:risk_level]} (#{risk_score})")
+  end
+  
+  def enforce_security_policy(device_info)
+    # Get appropriate policy based on device type and risk level
+    policy = @policy_engine.get_policy_for_device(device_info)
+    
+    # Apply the policy
+    if policy
+      @logger.info("Enforcing policy '#{policy[:name]}' for device #{device_info[:ip_address]}")
+      
+      # Apply network access controls
+      apply_network_controls(device_info, policy)
+      
+      # Apply monitoring controls
+      apply_monitoring_controls(device_info, policy)
+      
+      # Apply remediation actions if needed
+      apply_remediation_actions(device_info, policy) if device_info[:risk_level] == 'high'
+      
+      # Update device with applied policy
+      device_info[:applied_policy] = policy[:name]
+      device_info[:policy_applied_at] = Time.now
+    else
+      @logger.warn("No applicable policy found for device #{device_info[:ip_address]}")
+    end
+  end
+  
+  def apply_network_controls(device_info, policy)
+    # Implement network access controls based on policy
+    case policy[:network_control]
+    when 'isolate'
+      @network_segmenter.isolate_device(device_info[:ip_address], device_info[:mac_address])
+    when 'restrict'
+      @network_segmenter.restrict_device(device_info[:ip_address], device_info[:mac_address], policy[:allowed_destinations])
+    when 'monitor'
+      @network_segmenter.monitor_device(device_info[:ip_address], device_info[:mac_address])
+    end
+  end
+  
+  def apply_monitoring_controls(device_info, policy)
+    # Implement additional monitoring based on policy
+    if policy[:enhanced_monitoring]
+      @anomaly_detector.set_enhanced_monitoring(device_info[:ip_address])
+    end
+    
+    # Set up alerts
+    setup_alerts_for_device(device_info, policy[:alert_threshold])
+  end
+  
+  def apply_remediation_actions(device_info, policy)
+    # Take remediation actions for high-risk devices
+    case policy[:remediation_action]
+    when 'patch'
+      attempt_automatic_patching(device_info)
+    when 'credential_reset'
+      attempt_credential_reset(device_info)
+    when 'notify_admin'
+      notify_administrator(device_info)
+    end
+  end
+  
+  def generate_report
+    report = {
+      scan_time: Time.now,
+      total_devices: @discovered_devices.size,
+      risk_summary: summarize_risk_levels,
+      unauthorized_devices: count_unauthorized_devices,
+      vulnerable_devices: count_vulnerable_devices,
+      recommendations: generate_recommendations,
+      devices: @discovered_devices.values.map { |device| device_to_report_format(device) }
+    }
+    
+    @logger.info("Generated report with #{report[:total_devices]} devices")
+    report
+  end
+  
+  def device_to_report_format(device)
+    {
+      ip_address: device[:ip_address],
+      mac_address: device[:mac_address],
+      manufacturer: device[:manufacturer],
+      model: device[:model],
+      device_type: device[:device_type],
+      risk_level: device[:risk_level],
+      risk_score: device[:risk_score],
+      risk_factors: device[:risk_factors],
+      first_seen: device[:first_seen],
+      last_seen: device[:last_seen],
+      applied_policy: device[:applied_policy]
+    }
+  end
+  
+  # Helper classes
+  
+  class SecurityPolicyEngine
+    def initialize(policy_config)
+      @policies = policy_config || []
+    end
+    
+    def get_policy_for_device(device_info)
+      # Find the most appropriate policy based on device type and risk level
+      matching_policies = @policies.select do |policy|
+        matches_device_type?(policy, device_info) && 
+        matches_risk_level?(policy, device_info)
+      end
+      
+      # Return the highest priority matching policy
+      matching_policies.min_by { |p| p[:priority] }
+    end
+    
+    private
+    
+    def matches_device_type?(policy, device_info)
+      policy[:device_types].include?(device_info[:device_type]) || 
+      policy[:device_types].include?('any')
+    end
+    
+    def matches_risk_level?(policy, device_info)
+      policy[:risk_levels].include?(device_info[:risk_level]) || 
+      policy[:risk_levels].include?('any')
+    end
+  end
+  
+  class AnomalyDetector
+    def initialize
+      @baseline_data = {}
+      @enhanced_monitoring = []
+    end
+    
+    def start_monitoring(devices)
+      Thread.new do
+        loop do
+          devices.each do |mac, device|
+            check_for_anomalies(device) if @baseline_data[mac]
+            update_baseline(device)
+          end
+          sleep 300 # Check every 5 minutes
+        end
+      end
+    end
+    
+    def set_enhanced_monitoring(ip_address)
+      @enhanced_monitoring << ip_address unless @enhanced_monitoring.include?(ip_address)
+    end
+    
+    private
+    
+    def update_baseline(device)
+      mac = device[:mac_address]
+      @baseline_data[mac] ||= { traffic_patterns: [], connection_patterns: [] }
+      
+      # Update traffic patterns
+      @baseline_data[mac][:traffic_patterns] << device[:traffic_stats]
+      @baseline_data[mac][:traffic_patterns] = @baseline_data[mac][:traffic_patterns].last(10)
+      
+      # Update connection patterns
+      @baseline_data[mac][:connection_patterns] << {
+        timestamp: Time.now,
+        connections: device[:active_connections] || []
+      }
+      @baseline_data[mac][:connection_patterns] = @baseline_data[mac][:connection_patterns].last(10)
+    end
+    
+    def check_for_anomalies(device)
+      # Implement anomaly detection logic here
+    end
+  end
+  
+  class NetworkSegmenter
+    def initialize
+      # Initialize with network control capabilities
+    end
+    
+    def isolate_device(ip_address, mac_address)
+      # Implement device isolation
+    end
+    
+    def restrict_device(ip_address, mac_address, allowed_destinations)
+      # Implement traffic restrictions
+    end
+    
+    def monitor_device(ip_address, mac_address)
+      # Set up enhanced monitoring
+    end
+  end
+  
+  class SIEMIntegration
+    def initialize(siem_config)
+      @config = siem_config || {}
+      @enabled = @config['enabled'] || false
+      @endpoint = @config['endpoint']
+      @api_key = @config['api_key']
+    end
+    
+    def report_new_device(device_info)
+      return unless @enabled
+      
+      # Format event for SIEM
+      event = {
+        event_type: 'new_device_discovered',
+        timestamp: Time.now.iso8601,
+        device: {
+          ip_address: device_info[:ip_address],
+          mac_address: device_info[:mac_address],
+          manufacturer: device_info[:manufacturer],
+          model: device_info[:model],
+          risk_level: device_info[:risk_level]
+        }
+      }
+      
+      # Send to SIEM
+      send_to_siem(event)
+    end
+    
+    private
+    
+    def send_to_siem(event)
+      return unless @enabled
+      
+      begin
+        RestClient.post(
+          @endpoint,
+          event.to_json,
+          {
+            'Content-Type' => 'application/json',
+            'X-API-Key' => @api_key
+          }
+        )
+      rescue => e
+        # Log error but continue operation
+        puts "Error sending to SIEM: #{e.message}"
+      end
+    end
+  end
+  
+  private
+  
+  def load_device_database
+    # Load device fingerprints from database
+    JSON.parse(File.read(@config['device_db_path']), symbolize_names: true)
+  rescue
+    []
+  end
+  
+  def load_vulnerability_database
+    # Load known vulnerabilities from database
+    JSON.parse(File.read(@config['vulnerability_db_path']), symbolize_names: true)
+  rescue
+    []
+  end
+  
+  def device_authorized?(device_info)
+    # Check if device is in authorized inventory
+    @config['authorized_devices'].any? do |auth_device|
+      auth_device['mac_address'] == device_info[:mac_address]
+    end
+  end
+  
+  def check_vulnerabilities(device_info)
+    return [] unless device_info[:manufacturer] && device_info[:model]
+    
+    @known_vulnerabilities.select do |vuln|
+      vuln[:manufacturer] == device_info[:manufacturer] &&
+      vuln[:model] == device_info[:model] &&
+      (vuln[:firmware_version].nil? || vuln[:firmware_version] == device_info[:firmware_version])
+    end
+  end
+  
+  def has_default_credentials?(device_info)
+    # Check for default credentials
+    false # Simplified for example
+  end
+  
+  def uses_encryption?(device_info)
+    # Check if device uses encrypted communications
+    device_info[:protocols].include?('HTTPS') || 
+    device_info[:protocols].include?('SSH') || 
+    device_info[:protocols].include?('MQTTS')
+  end
+  
+  def has_excessive_access?(device_info)
+    # Check if device has more network access than needed
+    false # Simplified for example
+  end
+  
+  def categorize_risk_level(risk_score)
+    if risk_score >= 0.7
+      'high'
+    elsif risk_score >= 0.4
+      'medium'
+    else
+      'low'
+    end
+  end
+  
+  def start_protocol_scanners
+    # Start protocol-specific scanners based on configuration
+    start_mdns_scanner if @config['enable_mdns_scanning']
+    start_upnp_scanner if @config['enable_upnp_scanning']
+    start_mqtt_scanner if @config['enable_mqtt_scanning']
+  end
+  
+  def start_mdns_scanner
+    # Implement mDNS scanning for device discovery
+  end
+  
+  def start_upnp_scanner
+    # Implement UPnP scanning for device discovery
+  end
+  
+  def start_mqtt_scanner
+    # Implement MQTT scanning for IoT devices
+  end
+  
+  def start_vulnerability_assessment
+    Thread.new do
+      loop do
+        @discovered_devices.each do |mac, device|
+          # Skip recently assessed devices
+          next if device[:last_vulnerability_check] && 
+                 (Time.now - device[:last_vulnerability_check]) < 86400 # 24 hours
+          
+          vulnerabilities = check_vulnerabilities(device)
+          device[:vulnerabilities] = vulnerabilities
+          device[:last_vulnerability_check] = Time.now
+          
+          if vulnerabilities.any?
+            @logger.warn("Vulnerabilities found for device #{device[:ip_address]}: #{vulnerabilities.size}")
+            @siem_integration.report_vulnerabilities(device, vulnerabilities)
+          end
+        end
+        
+        sleep @config['vulnerability_check_interval'] || 86400 # Default: once per day
+      end
+    end
+  end
+  
+  def start_active_scanning
+    Thread.new do
+      loop do
+        # Get list of devices that need active scanning
+        devices_to_scan = @discovered_devices.values.select do |device|
+          device[:last_active_scan].nil? || 
+          (Time.now - device[:last_active_scan]) > (@config['active_scan_interval'] || 86400)
+        end
+        
+        devices_to_scan.each do |device|
+          perform_active_scan(device)
+          device[:last_active_scan] = Time.now
+        end
+        
+        sleep 3600 # Sleep for an hour between active scanning cycles
+      end
+    end
+  end
+  
+  def perform_active_scan(device)
+    @logger.info("Performing active scan on #{device[:ip_address]}")
+    
+    # Port scanning
+    open_ports = scan_ports(device[:ip_address])
+    device[:open_ports] = open_ports
+    
+    # Service identification
+    services = identify_services(device[:ip_address], open_ports)
+    device[:identified_services] = services
+    
+    # Web interface detection
+    if open_ports.include?(80) || open_ports.include?(443)
+      web_info = analyze_web_interface(device[:ip_address], open_ports)
+      device[:web_interface] = web_info
+    end
+  end
+  
+  def scan_ports(ip_address)
+    # Implement port scanning
+    [] # Simplified for example
+  end
+  
+  def identify_services(ip_address, ports)
+    # Identify services running on open ports
+    {} # Simplified for example
+  end
+  
+  def analyze_web_interface(ip_address, ports)
+    # Analyze web interface if present
+    {} # Simplified for example
+  end
+  
+  def lookup_mac_manufacturer(mac_address)
+    # Look up manufacturer by MAC OUI
+    nil # Simplified for example
+  end
+  
+  def grab_service_banners(ip_address, ports)
+    # Grab service banners for identification
+    {} # Simplified for example
+  end
+  
+  def parse_banner_information(device_info, banner_info)
+    # Parse banner information to identify device
+  end
+  
+  def summarize_risk_levels
+    high = @discovered_devices.values.count { |d| d[:risk_level] == 'high' }
+    medium = @discovered_devices.values.count { |d| d[:risk_level] == 'medium' }
+    low = @discovered_devices.values.count { |d| d[:risk_level] == 'low' }
+    
+    {
+      high: high,
+      medium: medium,
+      low: low
+    }
+  end
+  
+  def count_unauthorized_devices
+    @discovered_devices.values.count { |d| !device_authorized?(d) }
+  end
+  
+  def count_vulnerable_devices
+    @discovered_devices.values.count { |d| d[:vulnerabilities]&.any? }
+  end
+  
+  def generate_recommendations
+    recommendations = []
+    
+    # Check for unauthorized devices
+    if count_unauthorized_devices > 0
+      recommendations << "Review and authorize or remove #{count_unauthorized_devices} unauthorized devices"
+    end
+    
+    # Check for vulnerable devices
+    if count_vulnerable_devices > 0
+      recommendations << "Patch or update #{count_vulnerable_devices} devices with known vulnerabilities"
+    end
+    
+    # Check for segmentation needs
+    if needs_network_segmentation?
+      recommendations << "Implement network segmentation to isolate IoT devices from critical systems"
+    end
+    
+    # Check for monitoring gaps
+    if has_monitoring_gaps?
+      recommendations << "Enhance monitoring for devices in blind spots"
+    end
+    
+    recommendations
+  end
+  
+  def needs_network_segmentation?
+    # Determine if network segmentation is needed
+    high_risk_count = @discovered_devices.values.count { |d| d[:risk_level] == 'high' }
+    high_risk_count > 3
+  end
+  
+  def has_monitoring_gaps?
+    # Determine if there are monitoring gaps
+    @discovered_devices.values.any? { |d| d[:last_seen] && (Time.now - d[:last_seen]) > 3600 }
+  end
+  
+  def setup_alerts_for_device(device_info, threshold)
+    # Set up alerts for the device based on threshold
+  end
+  
+  def notify_administrator(device_info)
+    # Send notification to administrator
+  end
+  
+  def attempt_automatic_patching(device_info)
+    # Try to automatically patch the device
+  end
+  
+  def attempt_credential_reset(device_info)
+    # Try to reset default credentials
+  end
+end
+
+# Usage example
+if __FILE__ == $0
+  scanner = ShadowIoTScanner.new('config.yml')
+  scanner.start_scanning
+  
+  # Keep the main thread running
+  loop do
+    sleep 3600
+    report = scanner.generate_report
+    File.write('iot_scan_report.json', JSON.pretty_generate(report))
+  end
+end
